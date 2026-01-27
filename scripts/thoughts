@@ -1,0 +1,70 @@
+#!/bin/bash
+# thoughts - Central thoughts management CLI
+#
+# Usage:
+#   thoughts init [project-name]  - Initialize thoughts for a project
+#   thoughts sync [message]       - Sync thoughts to remote
+#   thoughts status               - Show sync status
+#   thoughts cd                   - Print path to thoughts repo (use: cd $(thoughts cd))
+
+set -e
+
+THOUGHTS_REPO="$HOME/repos/thoughts"
+SCRIPTS_DIR="$THOUGHTS_REPO/scripts"
+
+case "${1:-help}" in
+    init)
+        shift
+        "$SCRIPTS_DIR/init.sh" "$@"
+        ;;
+    sync)
+        shift
+        "$SCRIPTS_DIR/sync.sh" "$@"
+        ;;
+    status)
+        cd "$THOUGHTS_REPO"
+        echo "Thoughts repo: $THOUGHTS_REPO"
+        echo ""
+        echo "Git status:"
+        git status --short
+        echo ""
+        if git remote get-url origin &>/dev/null; then
+            echo "Remote: $(git remote get-url origin)"
+            git fetch --quiet 2>/dev/null || true
+            LOCAL=$(git rev-parse HEAD 2>/dev/null)
+            REMOTE=$(git rev-parse origin/main 2>/dev/null || git rev-parse origin/master 2>/dev/null || echo "")
+            if [ -n "$REMOTE" ]; then
+                AHEAD=$(git rev-list --count "$REMOTE..$LOCAL" 2>/dev/null || echo "0")
+                BEHIND=$(git rev-list --count "$LOCAL..$REMOTE" 2>/dev/null || echo "0")
+                echo "Ahead: $AHEAD, Behind: $BEHIND"
+            fi
+        else
+            echo "No remote configured"
+        fi
+        echo ""
+        echo "Projects with thoughts:"
+        ls -1 "$THOUGHTS_REPO/repos" 2>/dev/null || echo "  (none)"
+        ;;
+    cd)
+        echo "$THOUGHTS_REPO"
+        ;;
+    help|--help|-h|"")
+        echo "thoughts - Central thoughts management"
+        echo ""
+        echo "Usage:"
+        echo "  thoughts init [project-name]  Initialize thoughts for current project"
+        echo "  thoughts sync [message]       Sync thoughts to remote"
+        echo "  thoughts status               Show sync status"
+        echo "  thoughts cd                   Print path to thoughts repo"
+        echo ""
+        echo "Examples:"
+        echo "  cd ~/repos/myproject && thoughts init"
+        echo "  thoughts sync 'Added research notes'"
+        echo "  cd \$(thoughts cd)"
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Run 'thoughts help' for usage"
+        exit 1
+        ;;
+esac

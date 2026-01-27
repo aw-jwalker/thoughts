@@ -1,0 +1,17 @@
+# Obsidian
+.obsidian/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# Test artifacts
+.test-baseline.json
+
+# Windows Zone Identifiers
+*:Zone.Identifier
