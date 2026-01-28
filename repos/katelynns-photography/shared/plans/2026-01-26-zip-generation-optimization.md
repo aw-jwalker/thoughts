@@ -102,6 +102,20 @@ After implementation:
 - [ ] Albums up to 1,000 photos generate successfully
 - [ ] S3 Intelligent-Tiering applied to photos bucket
 - [ ] Daily EventBridge job runs successfully
+- [ ] Multiple download clicks don't create duplicate ZIPs (race condition protected)
+
+### Race Condition Protections
+
+This plan includes two levels of protection against duplicate ZIP generation:
+
+1. **API Level (Phase 3)**: The `_queue_zip_generation()` function uses a DynamoDB conditional write to atomically set `zip_status = "pending"`. Only the first request succeeds; subsequent concurrent requests see the condition fail and return the existing status instead of queuing duplicates.
+
+2. **Lambda Level (Phase 2)**: The ZIP Generator Lambda uses a conditional write to set `zip_status = "generating"` before starting work. If another Lambda is already processing the same album, the condition fails and the Lambda skips the work.
+
+This two-layer approach handles:
+- User clicking "Download All" multiple times quickly
+- Multiple users requesting the same album simultaneously
+- S3 event floods from batch photo uploads (hundreds of events → one ZIP generation)
 
 ## What We're NOT Doing
 
@@ -118,6 +132,41 @@ After implementation:
 | 1,000 photo max (soft limit) | Very large weddings may need splitting  | Step Functions distributed processing    |
 | 5-minute Lambda timeout      | Large albums with big files may timeout | Increase to 15 min or use Step Functions |
 | Single ZIP file              | Can't resume partial downloads          | Chunked downloads or torrent-style       |
+
+## Future Migration Path: Option B → Option C (Step Functions)
+
+This plan implements **Option B** (SQS + dedicated Lambda). If album sizes regularly exceed 1,000 photos in the future, we can migrate to **Option C** (Step Functions) with minimal disruption.
+
+### Why Migration is Low-Risk
+
+| Component | Reusable? | Notes |
+|-----------|-----------|-------|
+| SQS queue | ✅ Yes | Can remain as the entry point |
+| DynamoDB status tracking | ✅ Yes | Same `zip_status` field works |
+| S3 structure (`zips/{album_id}.zip`) | ✅ Yes | Output location unchanged |
+| API contract (status: ready/generating/pending) | ✅ Yes | Frontend doesn't need changes |
+| Frontend polling logic | ✅ Yes | Already handles async |
+
+### What Would Change
+
+```
+Option B:  SQS → ZIP Lambda → S3
+
+Option C:  SQS → Step Functions → [Worker Lambdas in parallel] → Combine Lambda → S3
+```
+
+The ZIP Generator Lambda code can be adapted as a "worker" that processes a batch of photos (e.g., 100 at a time) instead of the whole album.
+
+### Cost Difference
+
+Option C adds ~$0.002 (0.2¢) per album in Step Functions state transitions - negligible.
+
+### Migration Trigger
+
+Consider migrating when:
+- Albums regularly exceed 500-700 photos
+- Lambda timeouts appear in CloudWatch for ZIP generation
+- Clients report failed ZIP downloads for large albums
 
 ---
 
@@ -420,8 +469,26 @@ def process_album(album_id: str) -> dict:
         print(f"Album {album_id}: ZIP is current, skipping")
         return {"status": "skipped", "reason": "ZIP already current"}
 
-    # Update DynamoDB to show ZIP is generating
-    update_zip_status(album_id, "generating", current_photo_count)
+    # RACE CONDITION FIX: Use conditional write to "claim" the generation
+    # Only one Lambda can successfully set status to "generating"
+    # This prevents duplicate ZIP generation from concurrent requests
+    try:
+        album_table.update_item(
+            Key={"album_id": album_id},
+            UpdateExpression="SET zip_status = :generating, zip_generation_started_at = :now, photo_count = :count",
+            ConditionExpression="attribute_not_exists(zip_status) OR zip_status <> :generating",
+            ExpressionAttributeValues={
+                ":generating": "generating",
+                ":now": datetime.now(timezone.utc).isoformat(),
+                ":count": current_photo_count
+            }
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            # Another Lambda is already generating this ZIP - skip
+            print(f"Album {album_id}: Generation already in progress, skipping")
+            return {"status": "skipped", "reason": "Generation already in progress"}
+        raise
 
     try:
         # Generate the ZIP
@@ -779,8 +846,8 @@ async def get_download_url(
             )
 
         elif zip_status == "error":
-            # Previous generation failed - queue retry
-            _queue_zip_generation(album_id, source="api_retry")
+            # Previous generation failed - queue retry (with race condition protection)
+            _queue_zip_generation(album_id, source="api_retry")  # Will succeed since status is "error"
             return DownloadResponse(
                 album_id=album_id,
                 download_url=None,
@@ -791,17 +858,26 @@ async def get_download_url(
             )
 
         else:
-            # Not started - queue generation
-            _queue_zip_generation(album_id, source="api")
-            db_service.update_album(album_id, zip_status="pending")
-            return DownloadResponse(
-                album_id=album_id,
-                download_url=None,
-                expires_in=0,
-                file_count=photo_count,
-                status="pending",
-                message="Preparing your download. This may take a few minutes."
-            )
+            # Not started - queue generation (with race condition protection)
+            if _queue_zip_generation(album_id, source="api"):
+                return DownloadResponse(
+                    album_id=album_id,
+                    download_url=None,
+                    expires_in=0,
+                    file_count=photo_count,
+                    status="pending",
+                    message="Preparing your download. This may take a few minutes."
+                )
+            else:
+                # Another request already queued - return generating status
+                return DownloadResponse(
+                    album_id=album_id,
+                    download_url=None,
+                    expires_in=0,
+                    file_count=photo_count,
+                    status="generating",
+                    message="Your download is being prepared."
+                )
 
     except HTTPException:
         raise
@@ -812,18 +888,46 @@ async def get_download_url(
         raise HTTPException(status_code=500, detail="Failed to get download status")
 
 
-def _queue_zip_generation(album_id: str, source: str = "api"):
-    """Send message to SQS queue for ZIP generation."""
+def _queue_zip_generation(album_id: str, source: str = "api") -> bool:
+    """
+    Send message to SQS queue for ZIP generation.
+
+    Uses conditional write to prevent duplicate queuing from concurrent requests.
+    Returns True if successfully queued, False if another request already queued.
+    """
     import boto3
     import json
     import os
+    from botocore.exceptions import ClientError
 
+    # RACE CONDITION FIX: Atomically set status to "pending" only if not already pending/generating
+    # This prevents multiple API requests from queuing duplicate messages
+    try:
+        db_service.album_table.update_item(
+            Key={"album_id": album_id},
+            UpdateExpression="SET zip_status = :pending",
+            ConditionExpression="attribute_not_exists(zip_status) OR zip_status IN (:not_started, :error, :ready)",
+            ExpressionAttributeValues={
+                ":pending": "pending",
+                ":not_started": "not_started",
+                ":error": "error",
+                ":ready": "ready"  # Allow re-queue if ready but stale
+            }
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            # Already pending or generating - don't queue again
+            print(f"Album {album_id}: ZIP already queued/generating, skipping duplicate queue")
+            return False
+        raise
+
+    # Only queue if we successfully updated the status
     sqs = boto3.client("sqs", region_name=os.environ.get("AWS_REGION_NAME", "us-east-2"))
     queue_url = os.environ.get("ZIP_GENERATION_QUEUE_URL")
 
     if not queue_url:
         print(f"Warning: ZIP_GENERATION_QUEUE_URL not set, cannot queue generation")
-        return
+        return False
 
     sqs.send_message(
         QueueUrl=queue_url,
@@ -832,6 +936,7 @@ def _queue_zip_generation(album_id: str, source: str = "api"):
             "source": source
         })
     )
+    return True
 ```
 
 #### 2. Update DownloadResponse Model
