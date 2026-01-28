@@ -42,31 +42,25 @@ After implementation:
 4. **Smart invalidation**: ZIP regenerated when photo count changes
 5. **Cost optimization**: S3 Intelligent-Tiering for automatic tiering
 
-### Architecture
+### Architecture (MVP)
+
+The MVP focuses on registration-triggered ZIP generation. S3 event notifications for photo additions are deferred to a later phase.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Admin Upload Flow                            │
+│                     Admin Workflow (MVP)                         │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  Admin uploads photos    S3 Event         SQS Queue             │
-│  ─────────────────────►  Notification  ──►  zip-generation      │
-│                          (PutObject)       │                     │
-│                                            ▼                     │
-│                                       ZIP Generator Lambda       │
-│                                       (5-min timeout, 1024MB)    │
-│                                            │                     │
-│                                            ▼                     │
-│                                       zips/{album_id}.zip        │
+│  1. Admin uploads        2. Admin registers       3. ZIP queued  │
+│     photos to S3    ──►     album via API    ──►    via SQS     │
+│     (aws s3 sync)           POST /admin/albums                   │
 │                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                     Album Registration Flow                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  POST /admin/albums     ──►  Queue ZIP generation message        │
-│  (register_album)            to SQS                              │
+│                                                    ▼             │
+│                                             ZIP Generator Lambda │
+│                                             (5-min, 1024MB)      │
+│                                                    │             │
+│                                                    ▼             │
+│                                             zips/{album_id}.zip  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 
@@ -78,31 +72,53 @@ After implementation:
 │       │                                                          │
 │       ├─► ZIP ready? ──► Return presigned URL (6hr)             │
 │       │                                                          │
-│       └─► ZIP pending/generating? ──► Return status + ETA       │
+│       └─► ZIP pending/generating? ──► Return status + poll      │
+│       │                                                          │
+│       └─► ZIP not started? ──► Queue generation + return status │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Scheduled Maintenance                        │
+│                     Deferred: Photo Addition Flow                │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  EventBridge (daily)   ──►  Cleanup Lambda                       │
-│  rate(1 day)                - Check for stale ZIPs              │
-│                             - Update ZIP statuses                │
+│  [FUTURE] S3 Event      ──►  SQS Queue  ──►  ZIP Regeneration   │
+│           (PutObject)        (deduped)                           │
+│                                                                  │
+│  Use case: Admin adds photos to an already-shared album          │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Phase Summary
+
+| Phase | Name | Priority | Description |
+|-------|------|----------|-------------|
+| **0** | Test Environment Setup | 🔴 First | Create test album, verify current state |
+| **1** | SQS Queue Infrastructure | 🔴 Core | Queue for ZIP generation jobs |
+| **2** | ZIP Generator Lambda | 🔴 Core | Dedicated Lambda with higher limits |
+| **3** | Client API Updates | 🔴 Core | Async status + queue on download |
+| **4** | Admin API Updates | 🔴 Core | Queue ZIP on album registration |
+| **5** | Frontend Polling | 🔴 Core | UI shows generation status |
+| **6** | S3 Event Notifications | 🟡 Deferred | Auto-regenerate when photos added |
+| **7** | S3 Intelligent-Tiering | 🟢 Optional | Storage cost optimization |
+| **8** | EventBridge Maintenance | 🟢 Optional | Daily stale ZIP cleanup |
+
 ### Verification Checklist
 
-- [ ] Admin uploads album → ZIP auto-generated within 5 minutes
+**MVP (Phases 0-5):**
+- [ ] Test album created in S3 with sample photos
+- [ ] ZIP Generator Lambda can be manually invoked successfully
+- [ ] Admin registers album → ZIP auto-generated within 5 minutes
 - [ ] Client download shows "ready" status immediately for pre-generated ZIPs
 - [ ] Client download shows "preparing" status for pending ZIPs
-- [ ] Adding photos to album triggers ZIP regeneration
 - [ ] Albums up to 1,000 photos generate successfully
-- [ ] S3 Intelligent-Tiering applied to photos bucket
-- [ ] Daily EventBridge job runs successfully
 - [ ] Multiple download clicks don't create duplicate ZIPs (race condition protected)
+
+**Deferred (Phases 6-8):**
+- [ ] Adding photos to existing album triggers ZIP regeneration (Phase 6)
+- [ ] S3 Intelligent-Tiering applied to photos bucket (Phase 7)
+- [ ] Daily EventBridge job runs successfully (Phase 8)
 
 ### Race Condition Protections
 
@@ -170,18 +186,117 @@ Consider migrating when:
 
 ---
 
-## Phase 1: Infrastructure - SQS Queue & Event Notifications
+## Phase 0: Test Environment Setup
 
 ### Overview
 
-Create the foundational infrastructure: SQS queue for ZIP generation jobs and S3 event notifications to trigger ZIP regeneration.
+Before building anything, set up a test environment to validate the current system and provide test data for development. This follows test-driven development principles.
+
+### Goals
+
+1. Create a test album with sample photos in S3
+2. Verify the existing synchronous ZIP generation works (baseline)
+3. Document current performance characteristics
+4. Have test data ready for all subsequent phases
+
+### Steps
+
+#### 1. Create Test Album in S3
+
+```bash
+# Create a test album with 20-50 sample photos
+# Use actual photos or generate test images
+
+# Option A: Copy existing photos
+aws s3 sync ~/test-photos/ s3://katelynns-photography-client-albums/albums/test-zip-optimization/photos/ \
+    --exclude ".*"
+
+# Option B: Generate test images (if no photos available)
+mkdir -p /tmp/test-photos
+for i in {1..25}; do
+    convert -size 1920x1080 xc:gray +noise Random /tmp/test-photos/test-photo-$i.jpg 2>/dev/null || \
+    dd if=/dev/urandom bs=1024 count=500 2>/dev/null | base64 > /tmp/test-photos/test-photo-$i.jpg
+done
+aws s3 sync /tmp/test-photos/ s3://katelynns-photography-client-albums/albums/test-zip-optimization/photos/
+```
+
+#### 2. Register Test Album in DynamoDB
+
+```bash
+# Using AWS CLI
+aws dynamodb put-item \
+    --table-name katelynns-photography-album \
+    --item '{
+        "album_id": {"S": "test-zip-optimization"},
+        "name": {"S": "ZIP Optimization Test Album"},
+        "photo_count": {"N": "25"},
+        "created_at": {"S": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"},
+        "created_by": {"S": "test@example.com"}
+    }'
+```
+
+Or use the existing admin API if available:
+```bash
+curl -X POST https://api.katelynnsphotography.com/admin/albums \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"album_id": "test-zip-optimization", "name": "ZIP Optimization Test Album"}'
+```
+
+#### 3. Test Current ZIP Generation (Baseline)
+
+```bash
+# Test the current synchronous ZIP generation
+# This establishes baseline performance
+
+# If client portal is running locally:
+curl -X GET "http://localhost:8000/albums/test-zip-optimization/download" \
+    -H "Authorization: Bearer $CLIENT_TOKEN"
+
+# Or test via the deployed API (as a test client user)
+# Time how long it takes - this is the baseline to beat
+```
+
+#### 4. Document Baseline Metrics
+
+Record in this section after testing:
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Test album photo count | ___ | |
+| Total album size (MB) | ___ | |
+| Current ZIP generation time | ___ seconds | |
+| Lambda memory used | ___ MB | Check CloudWatch |
+| Lambda timeout? | Yes/No | |
+
+### Success Criteria
+
+- [ ] Test album exists at `s3://katelynns-photography-client-albums/albums/test-zip-optimization/photos/`
+- [ ] Album registered in DynamoDB
+- [ ] Baseline ZIP generation tested and timed
+- [ ] Metrics documented above
+
+### Test Data for Later Phases
+
+This test album will be used to:
+- **Phase 2**: Test ZIP Generator Lambda with manual invocation
+- **Phase 3**: Test API status responses
+- **Phase 4**: Test admin registration flow
+- **Phase 5**: Test frontend polling UI
+
+---
+
+## Phase 1: SQS Queue Infrastructure
+
+### Overview
+
+Create the SQS queue for ZIP generation jobs. S3 event notifications are deferred to Phase 6.
 
 ### AWS Services to Learn
 
-| Service                    | Purpose                                        | Documentation                                                                                                  |
-| -------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| **SQS**                    | Queue ZIP generation jobs for async processing | [SQS Developer Guide](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html) |
-| **S3 Event Notifications** | Trigger on photo uploads to queue regeneration | [S3 Event Notifications](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)        |
+| Service | Purpose | Documentation |
+|---------|---------|---------------|
+| **SQS** | Queue ZIP generation jobs for async processing | [SQS Developer Guide](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/welcome.html) |
 
 ### Changes Required:
 
@@ -194,9 +309,9 @@ Create the foundational infrastructure: SQS queue for ZIP generation jobs and S3
 # SQS Queue for ZIP Generation
 # ============================================================
 # Queue receives messages when:
-# 1. Album is registered via API
-# 2. Photos are uploaded to an album (S3 event)
-# 3. Manual regeneration requested
+# 1. Album is registered via API (Phase 4)
+# 2. Client requests download and ZIP doesn't exist (Phase 3)
+# 3. Photos are uploaded to an album (Phase 6 - deferred)
 
 resource "aws_sqs_queue" "zip_generation" {
   name                       = "${var.project_name}-zip-generation"
@@ -243,70 +358,32 @@ output "zip_generation_dlq_url" {
 }
 ```
 
-#### 2. Add S3 Event Notification for Photo Uploads
-
-**File**: `terraform/s3.tf`
-**Location**: Add after the lifecycle configuration (around line 153)
-
-```hcl
-# ============================================================
-# S3 Event Notification for Photo Uploads
-# ============================================================
-# Triggers ZIP regeneration when photos are added to albums
-
-resource "aws_s3_bucket_notification" "client_albums_notification" {
-  bucket = aws_s3_bucket.client_albums.id
-
-  queue {
-    queue_arn     = aws_sqs_queue.zip_generation.arn
-    events        = ["s3:ObjectCreated:*"]
-    filter_prefix = "albums/"
-    filter_suffix = ""  # All files under albums/
-  }
-
-  # Avoid triggering on ZIP files (would cause loop)
-  # The prefix filter ensures we only watch albums/, not zips/
-}
-
-# Allow S3 to send messages to SQS
-resource "aws_sqs_queue_policy" "allow_s3_to_sqs" {
-  queue_url = aws_sqs_queue.zip_generation.url
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect    = "Allow"
-        Principal = { Service = "s3.amazonaws.com" }
-        Action    = "sqs:SendMessage"
-        Resource  = aws_sqs_queue.zip_generation.arn
-        Condition = {
-          ArnLike = {
-            "aws:SourceArn" = aws_s3_bucket.client_albums.arn
-          }
-        }
-      }
-    ]
-  })
-}
-```
-
 ### Success Criteria:
 
 #### Automated Verification:
 
 - [ ] `terraform plan` shows SQS queue creation
-- [ ] `terraform plan` shows S3 event notification creation
 - [ ] `terraform apply` completes successfully
 
 #### Manual Verification:
 
 - [ ] SQS queue visible in AWS Console
 - [ ] Dead letter queue visible
-- [ ] Upload test file to `albums/test/photos/` prefix
-- [ ] Verify message appears in SQS queue (Console → Poll for messages)
+- [ ] Manually send test message to queue via AWS Console
+- [ ] Verify message appears (Console → Poll for messages)
 
-**Implementation Note**: After completing this phase, test the S3 → SQS notification before proceeding to the Lambda.
+**Test Command**:
+```bash
+# Send a test message manually
+aws sqs send-message \
+    --queue-url $(terraform output -raw zip_generation_queue_url) \
+    --message-body '{"album_id": "test-zip-optimization", "source": "manual-test"}'
+
+# Poll for the message
+aws sqs receive-message \
+    --queue-url $(terraform output -raw zip_generation_queue_url) \
+    --max-number-of-messages 1
+```
 
 ---
 
@@ -1015,7 +1092,88 @@ environment {
 
 ---
 
-## Phase 4: Frontend Polling for ZIP Status
+## Phase 4: Admin API - Queue ZIP on Album Registration
+
+### Overview
+
+Update the admin API to queue ZIP generation when an album is registered, so ZIPs are pre-generated before clients access them.
+
+### Changes Required:
+
+#### 1. Update Admin API Register Album
+
+**File**: `backend/admin_api/handler.py`
+**Changes**: Queue ZIP generation after album registration
+
+Add SQS client setup:
+
+```python
+# Add near other client setup
+sqs_client = boto3.client("sqs", region_name="us-east-2")
+ZIP_GENERATION_QUEUE_URL = os.environ.get("ZIP_GENERATION_QUEUE_URL", "")
+```
+
+Add to the `register_album` function (after the DynamoDB put):
+
+```python
+    album_table.put_item(Item=item)
+
+    # Queue ZIP generation
+    if ZIP_GENERATION_QUEUE_URL:
+        try:
+            sqs_client.send_message(
+                QueueUrl=ZIP_GENERATION_QUEUE_URL,
+                MessageBody=json.dumps({
+                    "album_id": album_id,
+                    "source": "registration"
+                })
+            )
+            print(f"Queued ZIP generation for album {album_id}")
+        except Exception as e:
+            print(f"Warning: Failed to queue ZIP generation: {e}")
+            # Don't fail registration if queue fails
+
+    return {
+        "statusCode": 201,
+        # ... rest of response
+```
+
+#### 2. Add Queue URL to Admin Lambda
+
+**File**: `terraform/lambda.tf`
+**Location**: Update admin_api Lambda environment variables
+
+```hcl
+environment {
+  variables = {
+    CLIENT_ALBUMS_BUCKET      = aws_s3_bucket.client_albums.id
+    COGNITO_USER_POOL_ID      = aws_cognito_user_pool.clients.id
+    ADMIN_EMAIL               = var.admin_email
+    ALBUM_TABLE_NAME          = aws_dynamodb_table.album.name
+    USER_TABLE_NAME           = aws_dynamodb_table.user.name
+    USER_ALBUM_TABLE_NAME     = aws_dynamodb_table.user_album.name
+    ZIP_GENERATION_QUEUE_URL  = aws_sqs_queue.zip_generation.url  # NEW
+  }
+}
+```
+
+### Success Criteria:
+
+#### Automated Verification:
+
+- [ ] `terraform apply` completes successfully
+- [ ] Lambda deploys without errors
+
+#### Manual Verification:
+
+- [ ] Register album via API → check SQS queue has message
+- [ ] ZIP Generator Lambda processes message
+- [ ] Album record has `zip_status: ready` after generation
+- [ ] Client download returns ready status immediately
+
+---
+
+## Phase 5: Frontend Polling for ZIP Status
 
 ### Overview
 
@@ -1206,90 +1364,101 @@ downloadAllBtn.addEventListener("click", handleDownloadAll);
 
 ---
 
-## Phase 5: Admin API - Queue ZIP on Album Registration
+## Phase 6: S3 Event Notifications (DEFERRED)
 
 ### Overview
 
-Update the admin API to queue ZIP generation when an album is registered, so ZIPs are pre-generated before clients access them.
+**Status: Deferred** - Implement only if the use case arises (admin adds photos to an already-shared album).
 
-### Changes Required:
+Add S3 event notifications to automatically trigger ZIP regeneration when photos are added to an existing album. This is deferred because the primary workflow (upload → register → share) doesn't require it.
 
-#### 1. Update Admin API Register Album
+### Use Case
 
-**File**: `backend/admin_api/handler.py`
-**Changes**: Queue ZIP generation after album registration
+```
+Admin workflow WITHOUT S3 events (MVP):
+1. Upload all photos
+2. Register album → ZIP generated
+3. Share with client
+4. Done
 
-Add SQS client setup:
-
-```python
-# Add near other client setup
-sqs_client = boto3.client("sqs", region_name="us-east-2")
-ZIP_GENERATION_QUEUE_URL = os.environ.get("ZIP_GENERATION_QUEUE_URL", "")
+Admin workflow WITH S3 events (if needed later):
+1. Upload photos, register, share
+2. Later: "Oops, forgot these 5 photos"
+3. Upload additional photos
+4. S3 event triggers ZIP regeneration automatically
 ```
 
-Add to the `register_album` function (after the DynamoDB put):
+### Changes Required (When Implementing)
 
-```python
-    album_table.put_item(Item=item)
+#### 1. Add S3 Event Notification
 
-    # Queue ZIP generation
-    if ZIP_GENERATION_QUEUE_URL:
-        try:
-            sqs_client.send_message(
-                QueueUrl=ZIP_GENERATION_QUEUE_URL,
-                MessageBody=json.dumps({
-                    "album_id": album_id,
-                    "source": "registration"
-                })
-            )
-            print(f"Queued ZIP generation for album {album_id}")
-        except Exception as e:
-            print(f"Warning: Failed to queue ZIP generation: {e}")
-            # Don't fail registration if queue fails
-
-    return {
-        "statusCode": 201,
-        # ... rest of response
-```
-
-#### 2. Add Queue URL to Admin Lambda
-
-**File**: `terraform/lambda.tf`
-**Location**: Update admin_api Lambda environment variables
+**File**: `terraform/s3.tf`
 
 ```hcl
-environment {
-  variables = {
-    CLIENT_ALBUMS_BUCKET      = aws_s3_bucket.client_albums.id
-    COGNITO_USER_POOL_ID      = aws_cognito_user_pool.clients.id
-    ADMIN_EMAIL               = var.admin_email
-    ALBUM_TABLE_NAME          = aws_dynamodb_table.album.name
-    USER_TABLE_NAME           = aws_dynamodb_table.user.name
-    USER_ALBUM_TABLE_NAME     = aws_dynamodb_table.user_album.name
-    ZIP_GENERATION_QUEUE_URL  = aws_sqs_queue.zip_generation.url  # NEW
+# ============================================================
+# S3 Event Notification for Photo Uploads
+# ============================================================
+# Triggers ZIP regeneration when photos are added to albums
+
+resource "aws_s3_bucket_notification" "client_albums_notification" {
+  bucket = aws_s3_bucket.client_albums.id
+
+  queue {
+    queue_arn     = aws_sqs_queue.zip_generation.arn
+    events        = ["s3:ObjectCreated:*"]
+    filter_prefix = "albums/"
+    filter_suffix = ""  # All files under albums/
   }
+
+  # Avoid triggering on ZIP files (would cause loop)
+  # The prefix filter ensures we only watch albums/, not zips/
+}
+
+# Allow S3 to send messages to SQS
+resource "aws_sqs_queue_policy" "allow_s3_to_sqs" {
+  queue_url = aws_sqs_queue.zip_generation.url
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "s3.amazonaws.com" }
+        Action    = "sqs:SendMessage"
+        Resource  = aws_sqs_queue.zip_generation.arn
+        Condition = {
+          ArnLike = {
+            "aws:SourceArn" = aws_s3_bucket.client_albums.arn
+          }
+        }
+      }
+    ]
+  })
 }
 ```
 
-### Success Criteria:
+### Success Criteria (When Implementing)
 
-#### Automated Verification:
+- [ ] `terraform apply` adds S3 event notification
+- [ ] Upload photo to existing registered album
+- [ ] SQS message received
+- [ ] ZIP Generator processes and updates ZIP
+- [ ] Client sees updated photo count
 
-- [ ] `terraform apply` completes successfully
-- [ ] Lambda deploys without errors
+### Why Deferred
 
-#### Manual Verification:
-
-- [ ] Register album via API → check SQS queue has message
-- [ ] ZIP Generator Lambda processes message
-- [ ] Album record has `zip_status: ready` after generation
-- [ ] Client download returns ready status immediately
+1. **Rarely needed**: Admin typically uploads all photos before sharing
+2. **Race condition complexity**: Batch uploads create event floods
+3. **Simplifies MVP**: Fewer moving parts to test and debug
+4. **Can add later**: No breaking changes required
 
 ---
 
-## Phase 6: S3 Intelligent-Tiering
+## Phase 7: S3 Intelligent-Tiering (OPTIONAL)
 
 ### Overview
+
+**Status: Optional** - Nice-to-have for cost optimization, not required for MVP.
 
 Implement S3 Intelligent-Tiering for automatic cost optimization of photo storage.
 
@@ -1371,9 +1540,11 @@ aws s3 sync "$SOURCE_DIR" "s3://$BUCKET/albums/$ALBUM_ID/photos/" \
 
 ---
 
-## Phase 7: EventBridge Scheduled Maintenance
+## Phase 8: EventBridge Scheduled Maintenance (OPTIONAL)
 
 ### Overview
+
+**Status: Optional** - Nice-to-have for maintenance automation, not required for MVP.
 
 Create a scheduled EventBridge rule to run daily maintenance: check for stale ZIPs, update statuses, and handle stuck generation jobs.
 
