@@ -6,7 +6,7 @@ branch: dev
 repository: fullstack.assetwatch
 topic: "Hub Diagnostic Empty PartNumber Bug Investigation"
 tags: [bug-investigation, hub-diagnostic, backend, lambda]
-status: in-progress
+status: completed
 last_updated: 2026-02-03
 last_updated_by: aw-jwalker
 type: bug_investigation
@@ -16,7 +16,7 @@ type: bug_investigation
 
 ## Task(s)
 
-**Status: Root Cause Identified, Fix Not Yet Implemented**
+**Status: Fix Implemented**
 
 Investigating a bug reported by Tracy Elsinger where `jobs-request-schedule` lambda received a malformed Hub value `"()_0015594"` causing "invalid topic" errors. The part number portion was empty parentheses `()` instead of a valid part number like `710-002`.
 
@@ -27,40 +27,90 @@ Investigating a bug reported by Tracy Elsinger where `jobs-request-schedule` lam
 
 ## Recent changes
 
-No code changes were made - this was an investigation session.
+### Fix Implemented (2026-02-03)
+
+**File:** `lambdas/lf-vero-prod-hub/main.py`
+
+1. **Fixed `get_hub_part_number_from_id()` (lines 32-49):**
+   - Changed to return `None` when no part number is found instead of returning the empty database result
+   - Added more detailed error logging including the `partID` and result count
+
+2. **Added validation in `addHub` handler (lines 881-893):**
+   - Added check `if HubPartNumber is None` before calling downstream functions
+   - Logs an error and skips `sync_hub_schedules()` and `update_hub_diagnostic_interval()` when part number lookup fails
+   - Prevents malformed Hub strings like `"()_0015594"` from being sent to the jobs-request-schedule lambda
 
 ## Learnings
 
-### Root Cause Identified
+### Complete Root Cause Analysis
 
-The bug originates in the **backend Lambda** `lf-vero-prod-hub/main.py`, NOT the frontend.
+The bug is a **multi-layer failure** spanning both frontend and backend:
 
-**Flow:**
-1. User adds a hub via "Add Hub" modal on Customer Detail page (`/customers/{id}/hubs`)
-2. Backend `addHub` handler (line 837) processes the request
-3. It calls `get_hub_part_number_from_id(jsonBody["partID"])` (line 877)
-4. If the query returns no results, the function returns the **original query result** (empty list/tuple) instead of handling the error
-5. `update_hub_diagnostic_interval()` (line 888-890) constructs: `"Hub": str(pn) + "_" + str(hsn)`
-6. If `pn` is an empty tuple `()`, then `str(())` = `"()"`, producing `"()_0015594"`
+#### Layer 1: Frontend Missing Validation
 
-**The Bug in `get_hub_part_number_from_id()`** (lines 32-48):
-```python
-def get_hub_part_number_from_id(hub_part_id):
-    localHubPartNum = db.mysql_read(...)
-    if len(localHubPartNum) == 1:
-        localHubPartNum = localHubPartNum[0]["PartNumber"]
-    else:
-        print("error retrieving hub part number")
-        # BUG: Returns the raw db result (empty list/tuple) instead of None or raising an error!
-    return localHubPartNum
+**File:** `apps/frontend/src/components/CustomerDetailPage/Hubs/AddHubs.tsx`
+
+1. `PartSelect` component (line 526) is `clearable`, allowing users to clear the part number selection
+2. When cleared, `onPartSelected` receives `null`, converted to empty string `""` (line 531)
+3. The SaveModal `disabled` condition (lines 494-500) does NOT check for empty `selectedPartNumber`:
+   ```typescript
+   disabled={
+     Object.values(errors).some((val) => val === true) ||
+     validSerialNumbers.length === 0 ||
+     notes.length === 3000 ||
+     hubStatusID === "" ||
+     selectedFacilityId === ""
+     // MISSING: selectedPartNumber === ""
+   }
+   ```
+4. **Result:** User can submit form with `partID: ""` (empty string)
+
+#### Layer 2: TypeScript Type Missing
+
+**File:** `apps/frontend/src/shared/api/HubService.ts:417-424`
+
+The `assignHub` function interface doesn't include `partID`:
+```typescript
+export async function assignHub(hubDetails: {
+  hubList: string;
+  facilityID: string;
+  hubStatusID: string;
+  locationNotes: string;
+  removalReason: number;
+  workOrderBOMID: number;
+  // partID is MISSING - no compile-time check!
+})
 ```
+
+#### Layer 3: Backend Missing Validation
+
+**File:** `lambdas/lf-vero-prod-hub/main.py`
+
+1. `addHub` handler (line 878) calls `get_hub_part_number_from_id(jsonBody["partID"])` without validating partID
+2. The function's SQL query: `SELECT PartNumber FROM Part WHERE PartID='{hub_part_id}'`
+3. With empty string: `WHERE PartID=''` → MySQL coerces to `WHERE PartID=0` → No match
+
+#### Layer 4: Poor Error Handling (FIXED)
+
+**Original Bug:** `get_hub_part_number_from_id()` returned the raw empty db result instead of `None`
+- Empty tuple `()` stringified to `"()"` → malformed Hub `"()_0015594"`
+
+### Why the Part Lookup Failed
+
+**Most Likely Scenario:**
+1. User opened "Add Hub" modal (default partID = "4")
+2. User cleared the Part Number dropdown (partID → "")
+3. User clicked Save (validation didn't block submission)
+4. Backend received `partID: ""`
+5. SQL: `SELECT PartNumber FROM Part WHERE PartID=''` returned empty
+6. Function returned empty tuple → `"()_0015594"`
 
 ### Database Findings
 
 - Serial number `0015594` has **TWO Transponder records**:
   - TransponderID 97386 → PartID 4 → `710-002` (Hub 2.0)
   - TransponderID 105508 → PartID 37 → `710-200` (Hub 3.0)
-- The PartNumber values in the database are valid (`710-002`, `710-200`) - the issue is the lookup failing
+- The PartNumber values in the database are valid - the lookup failed because `partID` was empty, NOT because the data was missing
 - User (UserID 8786) was on the "Add Hub" modal at 16:20:48 UTC, error occurred at 16:22:01 UTC
 
 ### User Activity (from UserPathLog)
@@ -73,8 +123,17 @@ The user was actively adding/removing hubs and hotspots on customer `df491f55-d0
 
 ## Action Items & Next Steps
 
-1. **Verify the return type of `db.mysql_read()`** - Check if it returns a tuple `()` or list `[]` when no results are found. This determines whether `str()` produces `"()"` or `"[]"`.
-   - Check: `/home/aw-jwalker/repos/fullstack.assetwatch/lambdas/lf-vero-prod-hub/db_resources.py`
+### Completed ✅
+
+1. **Backend Fix: `get_hub_part_number_from_id()`** - Now returns `None` instead of empty tuple when lookup fails
+2. **Backend Fix: `addHub` handler validation** - Added check for `HubPartNumber is None` before calling downstream functions
+3. **Verified `db.mysql_read()` return type** - Uses `pymysql.cursors.DictCursor` with `fetchall()`, returns tuple (empty `()` when no results)
+
+### Remaining (Frontend Fixes)
+
+1. **Add frontend validation** - Add `selectedPartNumber === ""` to SaveModal disabled condition in `AddHubs.tsx`
+2. **Fix TypeScript interface** - Add `partID: string` to `assignHub` function interface in `HubService.ts`
+3. **Consider removing `clearable`** from PartSelect in AddHubs, or add required indicator
 
 2. **Fix `get_hub_part_number_from_id()`** - The function should:
    - Return `None` or raise an exception when no part number is found
