@@ -103,23 +103,30 @@ flowchart TD
 flowchart TD
     START(["Check Sensor Action"])
 
-    START --> CHECK_FIRE{{"Hardware Event:<br/>Temp Over Fire Risk,<br/>CSR - Remove, or<br/>TOFR - Remove?"}}
+    START --> CHECK_TOFR_WORKFLOW{{"Is location in<br/>TOFR Workflow?<br/>(Has MP Status)"}}
 
-    CHECK_FIRE -->|Yes| CHECK_MP_STATUS{{"Does sensor have<br/>a Monitoring Point<br/>status?"}}
-    CHECK_MP_STATUS -->|No| REMOVE["REMOVE"]
-    CHECK_MP_STATUS -->|Yes| CHECK_BLACKLIST
+    CHECK_TOFR_WORKFLOW -->|Yes| TOFR_WORKFLOW
+    CHECK_TOFR_WORKFLOW -->|No| CHECK_FIRE_EVENT
 
-    CHECK_FIRE -->|No| CHECK_BLACKLIST{{"Monitoring Point<br/>Status:<br/>Blacklist?"}}
-    CHECK_BLACKLIST -->|Yes| REMOVE
-    CHECK_BLACKLIST -->|No| CHECK_BATTERY
+    subgraph TOFR_WORKFLOW["🔥 Temp Over Fire Risk Workflow"]
+        CHECK_BLACKLIST{{"MP Status:<br/>Blacklist?"}}
+        CHECK_RELEASED{{"MP Status:<br/>Released?"}}
 
-    CHECK_BATTERY{{"Battery Status:<br/>Critical?<br/>OR<br/>Hardware Event:<br/>TOFR - Replace?"}}
-    CHECK_BATTERY -->|Yes| REPLACE["REPLACE"]
+        CHECK_BLACKLIST -->|Yes| REMOVE["REMOVE"]
+        CHECK_BLACKLIST -->|No| CHECK_RELEASED
+        CHECK_RELEASED -->|Yes| REPLACE["REPLACE"]
+        CHECK_RELEASED -->|No| CONTINUE["Continue to<br/>standard checks"]
+    end
 
-    CHECK_BATTERY -->|No| CHECK_RELEASED{{"Monitoring Point<br/>Status:<br/>Released?"}}
-    CHECK_RELEASED -->|Yes| REPLACE
+    CONTINUE --> CHECK_FIRE_EVENT
 
-    CHECK_RELEASED -->|No| CHECK_NETWORK_EVENT{{"Hardware Event:<br/>CSR - Strengthen<br/>Network?"}}
+    CHECK_FIRE_EVENT{{"Hardware Event:<br/>Temp Over Fire Risk,<br/>CSR - Remove, or<br/>TOFR - Remove?"}}
+    CHECK_FIRE_EVENT -->|Yes| REMOVE
+
+    CHECK_FIRE_EVENT -->|No| CHECK_BATTERY{{"Battery Status:<br/>Critical?<br/>OR<br/>Hardware Event:<br/>TOFR - Replace?"}}
+    CHECK_BATTERY -->|Yes| REPLACE
+
+    CHECK_BATTERY -->|No| CHECK_NETWORK_EVENT{{"Hardware Event:<br/>CSR - Strengthen<br/>Network?"}}
     CHECK_NETWORK_EVENT -->|Yes| NETWORK["CHECK/ADD<br/>NETWORK EQUIPMENT"]
 
     CHECK_NETWORK_EVENT -->|No| CHECK_PLACEMENT_EVENT{{"Hardware Event:<br/>CSR - Check<br/>Placement?"}}
@@ -132,10 +139,13 @@ flowchart TD
 ```
 
 **Legend:**
+- **🔥 TOFR Workflow**: Special safety workflow for high-temperature monitoring points
+  - **Blacklist**: Confirmed safety risk - sensor must be removed
+  - **Released**: Risk resolved - sensor should be replaced
+  - **Pending Review**: Under evaluation (continues to standard checks)
 - **Hardware Events**: Visible in the "Hardware Events" column
 - **Battery Status**: From ML predictions (not directly visible, but shows in Action)
-- **Monitoring Point Status**: Status of the monitoring point location
-- **Sensor Status**: Current sensor state
+- **Sensor Status: Offline**: Sensor hasn't sent readings in 24+ hours
 
 ---
 
