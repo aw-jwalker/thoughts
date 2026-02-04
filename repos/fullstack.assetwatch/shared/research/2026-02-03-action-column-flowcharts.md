@@ -93,7 +93,55 @@ flowchart TD
 
 ---
 
+---
+
+## Diagram 4: CSR-Friendly Decision Flowchart
+
+**For Customer Support Representatives** - Uses terminology visible in the UI.
+
+```mermaid
+flowchart TD
+    START(["Check Sensor Action"])
+
+    START --> CHECK_FIRE{{"Hardware Event:<br/>Temp Over Fire Risk,<br/>CSR - Remove, or<br/>TOFR - Remove?"}}
+
+    CHECK_FIRE -->|Yes| CHECK_MP_STATUS{{"Does sensor have<br/>a Monitoring Point<br/>status?"}}
+    CHECK_MP_STATUS -->|No| REMOVE["REMOVE"]
+    CHECK_MP_STATUS -->|Yes| CHECK_BLACKLIST
+
+    CHECK_FIRE -->|No| CHECK_BLACKLIST{{"Monitoring Point<br/>Status:<br/>Blacklist?"}}
+    CHECK_BLACKLIST -->|Yes| REMOVE
+    CHECK_BLACKLIST -->|No| CHECK_BATTERY
+
+    CHECK_BATTERY{{"Battery Status:<br/>Critical?<br/>OR<br/>Hardware Event:<br/>TOFR - Replace?"}}
+    CHECK_BATTERY -->|Yes| REPLACE["REPLACE"]
+
+    CHECK_BATTERY -->|No| CHECK_RELEASED{{"Monitoring Point<br/>Status:<br/>Released?"}}
+    CHECK_RELEASED -->|Yes| REPLACE
+
+    CHECK_RELEASED -->|No| CHECK_NETWORK_EVENT{{"Hardware Event:<br/>CSR - Strengthen<br/>Network?"}}
+    CHECK_NETWORK_EVENT -->|Yes| NETWORK["CHECK/ADD<br/>NETWORK EQUIPMENT"]
+
+    CHECK_NETWORK_EVENT -->|No| CHECK_PLACEMENT_EVENT{{"Hardware Event:<br/>CSR - Check<br/>Placement?"}}
+    CHECK_PLACEMENT_EVENT -->|Yes| PLACEMENT["CHECK PLACEMENT"]
+
+    CHECK_PLACEMENT_EVENT -->|No| CHECK_SENSOR_STATUS{{"Sensor Status:<br/>Offline?"}}
+    CHECK_SENSOR_STATUS -->|Yes| TURNON["TURN ON"]
+
+    CHECK_SENSOR_STATUS -->|No| OK["OK"]
+```
+
+**Legend:**
+- **Hardware Events**: Visible in the "Hardware Events" column
+- **Battery Status**: From ML predictions (not directly visible, but shows in Action)
+- **Monitoring Point Status**: Status of the monitoring point location
+- **Sensor Status**: Current sensor state
+
+---
+
 ## Priority Summary
+
+### For Engineers
 
 | Priority | Action | Trigger |
 |:--------:|--------|---------|
@@ -103,3 +151,14 @@ flowchart TD
 | 4 | **Check Placement** | CSR_CHECK_PLACEMENT |
 | 5 | **Turn On** | Sensor OFFLINE |
 | 6 | **Ok** | Default (no issues) |
+
+### For CSRs
+
+| Priority | Action | When You See... |
+|:--------:|--------|-----------------|
+| 1 | **Remove** | Hardware Event: "Temp Over Fire Risk", "CSR - Remove", or "TOFR - Remove"<br/>OR Monitoring Point Status: "Blacklist" |
+| 2 | **Replace** | Battery Status: Critical (predicted)<br/>OR Hardware Event: "TOFR - Replace"<br/>OR Monitoring Point Status: "Released" |
+| 3 | **Check/Add Network Equipment** | Hardware Event: "CSR - Strengthen Network" |
+| 4 | **Check Placement** | Hardware Event: "CSR - Check Placement" |
+| 5 | **Turn On** | Sensor Status: "Offline" |
+| 6 | **Ok** | No issues detected |
