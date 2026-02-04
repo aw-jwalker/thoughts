@@ -16,88 +16,46 @@ flowchart TB
     end
 
     subgraph Automated["Automated (System)"]
-        FIRE_MONITOR["External Fire Risk<br/>Monitoring System"]
+        FIRE_MONITOR["Sensor Temperature<br/>Readings/Diagnostics"]
         ML["ML Battery<br/>Prediction Model"]
-        VOLTAGE["Low Voltage<br/>Detection"]
+        VOLTAGE["Sensor Voltage<br/>Readings/Diagnostics"]
     end
 
-    FIRE_MONITOR -->|"Populates temp table"| TOFR_PROC["HardwareIssue_<br/>ReceiversTempOverFireRisk"]
-    TOFR_PROC -->|"Creates"| TOFR_ISSUES["TEMP_OVER_FIRE_RISK (59)<br/>TOFR_REPLACE (66)<br/>TOFR_REMOVE (67)"]
+    FIRE_MONITOR -->|"High temp detected"| TOFR_PROC["HardwareIssue_<br/>ReceiversTempOverFireRisk"]
+    TOFR_PROC -->|"Creates"| TOFR_ISSUES["Temp Over Fire Risk<br/>TOFR - Replace<br/>TOFR - Remove"]
 
     ML -->|"Updates"| SENSORLIFE["SensorLife Table<br/>PredictedBatteryStatus"]
     SENSORLIFE -->|"'Critical'"| REPLACE_FLAG["hasReplaceAction = 1"]
 
-    VOLTAGE -->|"2.5V - 3.2V"| LOW_V["LOW_BATTERY_VOLTAGE (15)"]
+    VOLTAGE -->|"2.5V - 3.2V"| LOW_V["Low Battery Voltage"]
 
-    CSR_UI -->|"Manual entry"| CSR_ISSUES["CSR_CHECK_PLACEMENT (49)<br/>CSR_REMOVE (61)<br/>CSR_STRENGTHEN_NETWORK (64)"]
+    CSR_UI -->|"Manual entry"| CSR_ISSUES["CSR - Check Placement<br/>CSR - Remove<br/>CSR - Strengthen Network"]
 ```
 
 ---
 
-## Diagram 2: What Triggers "hasReplaceAction"?
+## Diagram 2: What Triggers "Replace" Action?
 
-The database calculates this flag based on battery status OR hardware issues.
+The database determines if a sensor needs replacement based on battery status OR hardware issues.
 
 ```mermaid
 flowchart LR
     subgraph Database["Database Layer"]
-        BATTERY["SensorLife Table<br/>PredictedBatteryStatus"]
-        HW_ISSUE["HardwareIssue Table<br/>Open issues with<br/>ActionID = 1"]
+        BATTERY["Battery Status<br/>(from ML predictions)"]
+        HW_ISSUE["Hardware Issues:<br/>- Low Battery Voltage<br/>- TOFR - Replace"]
     end
 
-    BATTERY -->|"= 'Critical'"| HAS_REPLACE
-    HW_ISSUE -->|"COUNT > 0"| HAS_REPLACE
+    BATTERY -->|"Critical"| REPLACE_ACTION
+    HW_ISSUE -->|"Open"| REPLACE_ACTION
 
-    HAS_REPLACE(["hasReplaceAction = 1"])
+    REPLACE_ACTION(["Sensor Needs<br/>Replacement"])
 ```
 
 ---
 
-## Diagram 3: Main Decision Flowchart
+## Diagram 3: Decision Flowchart
 
-Shows the priority-based rule evaluation. First matching rule wins.
-
-```mermaid
-flowchart TD
-    START(["Sensor Data Retrieved"])
-
-    START --> CHECK_REMOVE{"Has Remove Issue?<br/>(TEMP_OVER_FIRE_RISK,<br/>CSR_REMOVE, or<br/>TOFR_REMOVE)"}
-
-    CHECK_REMOVE -->|Yes| CHECK_FLAG1{"Feature Flag<br/>releaseMpTofStatus?"}
-    CHECK_FLAG1 -->|No| REMOVE["REMOVE"]
-    CHECK_FLAG1 -->|Yes| CHECK_MPSTATUS{"Has MP Status?"}
-    CHECK_MPSTATUS -->|No| REMOVE
-    CHECK_MPSTATUS -->|Yes| CHECK_BLACKLIST
-
-    CHECK_REMOVE -->|No| CHECK_BLACKLIST{"Is Blacklisted?<br/>(mpStatusId = Blacklist)"}
-    CHECK_BLACKLIST -->|Yes + Flag On| REMOVE
-    CHECK_BLACKLIST -->|No or Flag Off| CHECK_REPLACE
-
-    CHECK_REPLACE{"Needs Replacement?<br/>(hasReplaceAction=1<br/>OR TOFR_REPLACE issue)"}
-    CHECK_REPLACE -->|Yes| REPLACE["REPLACE"]
-
-    CHECK_REPLACE -->|No| CHECK_RELEASED{"MP Status = Released?<br/>(+ Flag On)"}
-    CHECK_RELEASED -->|Yes| REPLACE
-
-    CHECK_RELEASED -->|No| CHECK_NETWORK{"Has<br/>CSR_STRENGTHEN_NETWORK<br/>issue?"}
-    CHECK_NETWORK -->|Yes| NETWORK["CHECK/ADD<br/>NETWORK EQUIPMENT"]
-
-    CHECK_NETWORK -->|No| CHECK_PLACEMENT{"Has<br/>CSR_CHECK_PLACEMENT<br/>issue?"}
-    CHECK_PLACEMENT -->|Yes| PLACEMENT["CHECK PLACEMENT"]
-
-    CHECK_PLACEMENT -->|No| CHECK_OFFLINE{"Sensor Status<br/>= OFFLINE?"}
-    CHECK_OFFLINE -->|Yes| TURNON["TURN ON"]
-
-    CHECK_OFFLINE -->|No| OK["OK"]
-```
-
----
-
----
-
-## Diagram 4: CSR-Friendly Decision Flowchart
-
-**For Customer Support Representatives** - Uses terminology visible in the UI.
+Shows how the Action column value is determined, using terminology visible in the UI.
 
 ```mermaid
 flowchart TD
@@ -150,19 +108,6 @@ flowchart TD
 ---
 
 ## Priority Summary
-
-### For Engineers
-
-| Priority | Action | Trigger |
-|:--------:|--------|---------|
-| 1 | **Remove** | Fire risk, CSR removal, Blacklisted MP |
-| 2 | **Replace** | Critical battery, ActionID=1 issue, Released MP |
-| 3 | **Check/Add Network** | CSR_STRENGTHEN_NETWORK |
-| 4 | **Check Placement** | CSR_CHECK_PLACEMENT |
-| 5 | **Turn On** | Sensor OFFLINE |
-| 6 | **Ok** | Default (no issues) |
-
-### For CSRs
 
 | Priority | Action | When You See... |
 |:--------:|--------|-----------------|
