@@ -70,11 +70,13 @@ The database determines if a sensor needs replacement based on battery status OR
 flowchart LR
     subgraph Database["Database Layer"]
         BATTERY["Battery Status<br/>(from ML predictions)"]
+        OR_NODE{{"OR"}}
         HW_ISSUE["- Low Battery Voltage<br/>- TOFR - Replace"]
     end
 
-    BATTERY -->|"= Critical"| REPLACE_ACTION
-    HW_ISSUE -->|"Open"| REPLACE_ACTION
+    BATTERY -->|"= Critical"| OR_NODE
+    HW_ISSUE -->|"Open"| OR_NODE
+    OR_NODE --> REPLACE_ACTION
 
     REPLACE_ACTION(["hasReplaceAction = 1"])
 
@@ -143,6 +145,29 @@ flowchart TD
     style CHECK4 fill:#FFF9C4,stroke:#F57F17,color:#000
     style LEGEND fill:#FFF9C4,stroke:#F57F17,color:#000
 ```
+
+---
+
+## Diagram 4: "Turn On" Troubleshooting Workflow
+
+Shows what happens when a user sees "Turn On" in the Action column and attempts to resolve it.
+
+```mermaid
+flowchart TD
+    START(["User sees 'Turn On'<br/>in Action column"])
+
+    START --> ACTION["User attempts to<br/>turn on sensor"]
+
+    ACTION --> CHECK{{"Did sensor<br/>turn on?"}}
+
+    CHECK -->|"Yes"| SUCCESS["Sensor is online<br/>Action becomes 'Ok'"]
+    CHECK -->|"No"| FAILED["Sensor did not respond<br/>Action becomes 'Replace'"]
+
+    SUCCESS --> RESOLVED["\u2705 Resolved"]
+    FAILED --> NEXT_STEP["Sensor needs<br/>replacement"]
+```
+
+**Note**: This diagram shows the user troubleshooting process that occurs AFTER the system has already determined the Action column should display "Turn On" (from Diagram 3).
 
 ---
 

@@ -83,97 +83,197 @@ All existing Serial# columns follow similar patterns:
 
 ### Strategy:
 
-1. **Create reusable utility function** - Centralize the formatting logic for consistency
-2. **Update each datatable** - Add new column definition while preserving existing Serial# column
-3. **Maintain existing patterns** - Follow established patterns for links, role-based rendering, and styling
-4. **Test each table individually** - Verify changes don't break existing functionality
+1. **Consolidate serial number utilities** - Rename and clean up existing utilities
+2. **Create reusable utility function** - Centralize the formatting logic for consistency
+3. **Update each datatable** - Add new column definition while preserving existing Serial# column
+4. **Maintain existing patterns** - Follow established patterns for links, role-based rendering, and styling
+5. **Test each table individually** - Verify changes don't break existing functionality
 
 ### Design Decision:
 
-**Utility Function Location**: `apps/frontend/src/utils/formatHardwareSerial.ts`
+**Utility Function Location**: `apps/frontend/src/utils/serialNumberUtils.ts`
 
 This function will:
+- Be named `formatPartSerial()` - matching user-facing "Part:Serial" terminology
 - Accept `partNumber`, `partRevision?`, and `serialNumber`
 - Return formatted string: `{partNumber}{partRevision}:{serialNumber}`
 - Handle missing revision gracefully (Hotspots case)
+- Be the inverse of existing `extractPartNumberFromBarcode()`
 
-## Phase 1: Create Utility Function
+## Phase 0: Consolidate Serial Number Utilities
 
 ### Overview
 
-Create a reusable utility function to format the Part:Serial string consistently across all datatables.
+Clean up and consolidate serial number utilities into a single file. Remove dead code from January 2026 when the serial number generator was removed from the UI.
 
 ### Changes Required:
 
-#### 1. Create Utility Function
+#### 1. Rename File
 
-**File**: `apps/frontend/src/utils/formatHardwareSerial.ts`
-**Changes**: Create new file
+**Current**: `apps/frontend/src/utils/stripPartNumber.ts`
+**New**: `apps/frontend/src/utils/serialNumberUtils.ts`
+
+Rationale: File now contains multiple serial number operations (strip, extract, format), not just stripping.
+
+#### 2. Delete Dead Code
+
+**Files to Delete**:
+- `apps/frontend/src/utils/receiverSerialNumberGenerator.ts` - Function unused since Jan 16, 2026
+- `apps/frontend/src/components/SensorCheckPage/SerialNumberGenerator.tsx` - Component removed from UI Jan 16, 2026
+
+These were removed from the SensorCheck page but the files were left behind.
+
+#### 3. Update Import Statements
+
+**Files with imports to update** (9 files):
+1. `apps/frontend/src/utils/__tests__/stripPartNumber.test.ts`
+2. `apps/frontend/src/pages/SensorCheck.tsx`
+3. `apps/frontend/src/components/common/forms/ProductInput.tsx`
+4. `apps/frontend/src/components/common/forms/SerialNumberInput.tsx`
+5. `apps/frontend/src/components/common/forms/SimpleSerialNumberInput.tsx`
+6. `apps/frontend/src/components/TrackInventoryPage/TrackInventoryHeader.tsx`
+7. `apps/frontend/src/components/UpdateMonitoringPointModal/hooks/useColumnDefinitions.ts`
+8. `apps/frontend/src/components/GeneralSearch/SpotlightSearchProvider.tsx`
+9. `apps/frontend/src/components/CustomerDetailPage/WorkOrders/Bom.tsx`
+
+**Find/Replace**:
+```typescript
+// OLD:
+from "@utils/stripPartNumber"
+
+// NEW:
+from "@utils/serialNumberUtils"
+```
+
+#### 4. Rename Test File
+
+**Current**: `apps/frontend/src/utils/__tests__/stripPartNumber.test.ts`
+**New**: `apps/frontend/src/utils/__tests__/serialNumberUtils.test.ts`
+
+Update its own import at the top of the file.
+
+### Success Criteria:
+
+#### Automated Verification:
+
+- [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
+- [ ] All tests pass: `pnpm --filter frontend test serialNumberUtils`
+
+#### Manual Verification:
+
+- [ ] No references to `stripPartNumber.ts` remain in codebase
+- [ ] No references to `receiverSerialNumberGenerator` remain
+- [ ] All existing functionality works (import paths updated correctly)
+- [ ] Serial number validation still works in forms
+- [ ] Barcode parsing still works in UpdateMonitoringPointModal
+
+**Implementation Note**: After completing this phase and all automated verification passes, continue to Phase 1.
+
+---
+
+## Phase 1: Add Format Utility Function
+
+### Overview
+
+Add the `formatPartSerial()` function to the newly renamed `serialNumberUtils.ts` file. This function is the inverse of the existing `extractPartNumberFromBarcode()` function.
+
+### Changes Required:
+
+#### 1. Add Function to serialNumberUtils.ts
+
+**File**: `apps/frontend/src/utils/serialNumberUtils.ts`
+**Changes**: Add new function after `extractPartNumberFromBarcode`
 
 ```typescript
 /**
- * Formats hardware identifier in the format: {PartNumber}{PartRevision}:{SerialNumber}
+ * Formats part serial identifier in the format: {PartNumber}{Revision}:{SerialNumber}
+ * This is the inverse of extractPartNumberFromBarcode().
  * For Hotspots (which use MAC instead of serial): {PartNumber}:{MAC}
  *
  * @param partNumber - The part number (e.g., "710-001")
  * @param serialNumber - The serial number or MAC address
- * @param partRevision - Optional part revision (e.g., "A", "B")
- * @returns Formatted string (e.g., "710-001A:1234567" or "710-003:00:1A:2B:3C:4D")
+ * @param revision - Optional part revision (e.g., "A", "B") - will be normalized to uppercase
+ * @returns Formatted part serial string (e.g., "710-001A:1234567" or "710-003:00:1A:2B:3C:4D")
+ *
+ * @example
+ * formatPartSerial("710-001", "1015535", "f")  // "710-001F:1015535"
+ * formatPartSerial("710-003", "AA:BB:CC:DD:EE:FF")  // "710-003:AA:BB:CC:DD:EE:FF"
  */
-export function formatHardwareSerial(
+export function formatPartSerial(
   partNumber: string,
   serialNumber: string,
-  partRevision?: string,
+  revision?: string,
 ): string {
   if (!partNumber || !serialNumber) {
     return serialNumber || "";
   }
 
-  const revision = partRevision || "";
-  return `${partNumber}${revision}:${serialNumber}`;
+  const normalizedRevision = revision?.toUpperCase() || "";
+  return `${partNumber}${normalizedRevision}:${serialNumber}`;
 }
 ```
 
-#### 2. Create Test File
+#### 2. Add Tests to serialNumberUtils.test.ts
 
-**File**: `apps/frontend/src/utils/__tests__/formatHardwareSerial.test.ts`
-**Changes**: Create new file
+**File**: `apps/frontend/src/utils/__tests__/serialNumberUtils.test.ts`
+**Changes**: Add new test suite after existing tests
 
 ```typescript
-import { describe, it, expect } from "vitest";
-import { formatHardwareSerial } from "../formatHardwareSerial";
-
-describe("formatHardwareSerial", () => {
+describe("formatPartSerial", () => {
   it("formats with part number, revision, and serial", () => {
-    expect(formatHardwareSerial("710-001", "1234567", "A")).toBe(
+    expect(formatPartSerial("710-001", "1234567", "A")).toBe(
       "710-001A:1234567",
     );
   });
 
   it("formats without revision (Hotspot case)", () => {
-    expect(formatHardwareSerial("710-003", "00:1A:2B:3C:4D")).toBe(
+    expect(formatPartSerial("710-003", "00:1A:2B:3C:4D")).toBe(
       "710-003:00:1A:2B:3C:4D",
     );
   });
 
   it("handles empty revision string", () => {
-    expect(formatHardwareSerial("710-002", "7654321", "")).toBe(
+    expect(formatPartSerial("710-002", "7654321", "")).toBe(
       "710-002:7654321",
     );
   });
 
+  it("normalizes lowercase revision to uppercase", () => {
+    expect(formatPartSerial("710-001", "1234567", "f")).toBe(
+      "710-001F:1234567",
+    );
+  });
+
+  it("normalizes mixed-case revision to uppercase", () => {
+    expect(formatPartSerial("710-100", "0000017", "Ra")).toBe(
+      "710-100RA:0000017",
+    );
+  });
+
   it("returns serial number when part number is missing", () => {
-    expect(formatHardwareSerial("", "1234567", "A")).toBe("1234567");
+    expect(formatPartSerial("", "1234567", "A")).toBe("1234567");
   });
 
   it("returns empty string when both part and serial are missing", () => {
-    expect(formatHardwareSerial("", "")).toBe("");
+    expect(formatPartSerial("", "")).toBe("");
   });
 
   it("handles MAC addresses for Hotspots", () => {
-    expect(formatHardwareSerial("710-003", "AA:BB:CC:DD:EE:FF")).toBe(
+    expect(formatPartSerial("710-003", "AA:BB:CC:DD:EE:FF")).toBe(
       "710-003:AA:BB:CC:DD:EE:FF",
     );
+  });
+
+  it("is inverse of extractPartNumberFromBarcode", () => {
+    const input = "710-001F:1015535";
+    const parsed = extractPartNumberFromBarcode(input);
+    const formatted = formatPartSerial(
+      parsed.partNumber!,
+      parsed.serialNumber,
+      parsed.revision!,
+    );
+    expect(formatted).toBe(input);
   });
 });
 ```
@@ -183,12 +283,14 @@ describe("formatHardwareSerial", () => {
 #### Automated Verification:
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
-- [ ] Test passes: `pnpm --filter frontend test formatHardwareSerial`
+- [ ] Test passes: `pnpm --filter frontend test serialNumberUtils`
 - [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 
 #### Manual Verification:
 
-- [ ] Utility function correctly formats all test cases
+- [ ] Function correctly formats all test cases
+- [ ] Revision normalization works (lowercase → uppercase)
+- [ ] Function is inverse of `extractPartNumberFromBarcode`
 - [ ] No imports or exports errors
 
 **Implementation Note**: After completing this phase and all automated verification passes, continue to Phase 2.
@@ -213,7 +315,7 @@ Add "Part:Serial" column to the active sensors datatable in CustomerDetail page.
 
 **Import addition** (after other imports):
 ```typescript
-import { formatHardwareSerial } from "@utils/formatHardwareSerial";
+import { formatPartSerial } from "@utils/serialNumberUtils";
 ```
 
 **New column definition** (insert after line 163, before the existing "Serial#" column):
@@ -226,7 +328,7 @@ import { formatHardwareSerial } from "@utils/formatHardwareSerial";
   checkboxSelection: !isCustomerHardwareStatusRoleUser,
   headerCheckboxSelection: !isCustomerHardwareStatusRoleUser,
   valueGetter: ({ data }: { data: Sensor }) =>
-    formatHardwareSerial(data.smpn, data.ssn, data.partRevision),
+    formatPartSerial(data.smpn, data.ssn, data.partRevision),
   cellRenderer: ({ data, value }: { data: Sensor; value: string }) =>
     isCustomerHardwareStatusRoleUser || isPartner ? (
       value
@@ -316,7 +418,7 @@ Add "Part:Serial" column to the spare sensors datatable in CustomerDetail page.
   minWidth: 140,
   pinned: "left" as const,
   valueGetter: ({ data }: { data: SpareSensor }) =>
-    formatHardwareSerial(data.partNumber, data.serialNumber, data.partRevision),
+    formatPartSerial(data.partNumber, data.serialNumber, data.partRevision),
   cellRenderer: ({ data, value }: { data: SpareSensor; value: string }) => {
     return (
       <Link
@@ -398,7 +500,7 @@ Add "Part:Serial" column to the hubs datatable in CustomerDetail page.
 
 **Import addition** (after other imports):
 ```typescript
-import { formatHardwareSerial } from "@utils/formatHardwareSerial";
+import { formatPartSerial } from "@utils/serialNumberUtils";
 ```
 
 **New column definition** (insert at line 39, before existing "Serial#" column):
@@ -411,7 +513,7 @@ import { formatHardwareSerial } from "@utils/formatHardwareSerial";
   checkboxSelection: () => !isCustomerHardwareStatusRoleUser,
   headerCheckboxSelection: !isCustomerHardwareStatusRoleUser,
   valueGetter: ({ data }: { data: SelectedHub }) =>
-    formatHardwareSerial(data.pn, data.hsn, data.partRevision),
+    formatPartSerial(data.pn, data.hsn, data.partRevision),
   cellRenderer: function ({
     data,
     value,
@@ -506,7 +608,7 @@ Add "Part:Serial" column to the hotspots datatable in CustomerDetail page. Note:
 
 **Import addition** (after other imports):
 ```typescript
-import { formatHardwareSerial } from "@utils/formatHardwareSerial";
+import { formatPartSerial } from "@utils/serialNumberUtils";
 ```
 
 **New column definition** (insert at line 17, before existing "MAC" column):
@@ -519,7 +621,7 @@ import { formatHardwareSerial } from "@utils/formatHardwareSerial";
   checkboxSelection: () => !isCustomerHardwareStatusRoleUser,
   headerCheckboxSelection: !isCustomerHardwareStatusRoleUser,
   valueGetter: ({ data }: { data: Hotspot }) =>
-    formatHardwareSerial(data.partNumber, data.MAC),
+    formatPartSerial(data.partNumber, data.MAC),
 },
 ```
 
@@ -574,7 +676,7 @@ Add "Part:Serial" column to the Sensor Check results datatable.
 
 **Import addition** (after other imports):
 ```typescript
-import { formatHardwareSerial } from "@utils/formatHardwareSerial";
+import { formatPartSerial } from "@utils/serialNumberUtils";
 ```
 
 **New column definition** (insert after line 228, after "Scan Order" column):
@@ -586,7 +688,7 @@ import { formatHardwareSerial } from "@utils/formatHardwareSerial";
   pinned: "left" as const,
   lockPosition: "left" as const,
   valueGetter: ({ data }: { data: SensorCheckSensor }) =>
-    formatHardwareSerial(data.pn, data.smsn, data.partRevision),
+    formatPartSerial(data.pn, data.smsn, data.partRevision),
   cellRenderer({ data, value }: { data: SensorCheckSensor; value: string }) {
     return (
       <span>
@@ -670,7 +772,7 @@ Add "Part:Serial" column to the Work Order Hardware Status datatable.
 
 **Import addition** (after other imports):
 ```typescript
-import { formatHardwareSerial } from "@utils/formatHardwareSerial";
+import { formatPartSerial } from "@utils/serialNumberUtils";
 ```
 
 **Update columns array** (line 76-141):
@@ -683,7 +785,7 @@ Add new column definition at the beginning of the columns array (after the condi
   minWidth: 140,
   pinned: "left" as const,
   valueGetter: ({ data }: { data: HardwareData }) =>
-    formatHardwareSerial(data.partNumber, data.serialNumber, data.partRevision),
+    formatPartSerial(data.partNumber, data.serialNumber, data.partRevision),
   cellRenderer({
     data: { productName, hardwareID, serialNumber, partNumber, partRevision },
     value,
