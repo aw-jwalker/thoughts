@@ -53,7 +53,7 @@ All existing Serial# columns follow similar patterns:
 #### Automated Verification:
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
-- [ ] ESLint passes: `pnpm --filter frontend lint`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 - [ ] Frontend tests pass: `pnpm --filter frontend test`
 - [ ] No console errors when viewing any of the affected pages
 
@@ -184,7 +184,7 @@ describe("formatHardwareSerial", () => {
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
 - [ ] Test passes: `pnpm --filter frontend test formatHardwareSerial`
-- [ ] ESLint passes: `pnpm --filter frontend lint`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 
 #### Manual Verification:
 
@@ -278,7 +278,7 @@ import { formatHardwareSerial } from "@utils/formatHardwareSerial";
 #### Automated Verification:
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
-- [ ] ESLint passes: `pnpm --filter frontend lint`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 - [ ] Frontend tests pass: `pnpm --filter frontend test`
 
 #### Manual Verification:
@@ -365,7 +365,7 @@ Add "Part:Serial" column to the spare sensors datatable in CustomerDetail page.
 #### Automated Verification:
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
-- [ ] ESLint passes: `pnpm --filter frontend lint`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 - [ ] Frontend tests pass: `pnpm --filter frontend test`
 
 #### Manual Verification:
@@ -473,7 +473,7 @@ import { formatHardwareSerial } from "@utils/formatHardwareSerial";
 #### Automated Verification:
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
-- [ ] ESLint passes: `pnpm --filter frontend lint`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 - [ ] Frontend tests pass: `pnpm --filter frontend test`
 
 #### Manual Verification:
@@ -542,7 +542,7 @@ import { formatHardwareSerial } from "@utils/formatHardwareSerial";
 #### Automated Verification:
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
-- [ ] ESLint passes: `pnpm --filter frontend lint`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 - [ ] Frontend tests pass: `pnpm --filter frontend test`
 
 #### Manual Verification:
@@ -635,7 +635,7 @@ The Serial # column should remain as:
 #### Automated Verification:
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
-- [ ] ESLint passes: `pnpm --filter frontend lint`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 - [ ] Frontend tests pass: `pnpm --filter frontend test`
 
 #### Manual Verification:
@@ -756,7 +756,7 @@ Add new column definition at the beginning of the columns array (after the condi
 #### Automated Verification:
 
 - [ ] TypeScript compilation passes: `pnpm --filter frontend typecheck`
-- [ ] ESLint passes: `pnpm --filter frontend lint`
+- [ ] ESLint passes: `cd apps/frontend && pnpm exec eslint src/`
 - [ ] Frontend tests pass: `pnpm --filter frontend test`
 
 #### Manual Verification:
