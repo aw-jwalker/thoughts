@@ -5,10 +5,11 @@ git_commit: aef6609646df1ec10108205f749be14f7d84fce3
 branch: dev
 repository: fullstack.assetwatch
 topic: "Firmware Version Management, Lazy Loader, and FirmwareID/FirmwareVersion Update Flow"
-tags: [research, codebase, firmware, lazy-loader, receiver, sensor, firmware-update]
+tags: [research, codebase, firmware, lazy-loader, receiver, sensor, firmware-update, jobs-repo, mqtt]
 status: complete
 last_updated: 2026-02-06
 last_updated_by: Jackson Walker
+last_updated_note: "Added complete external service flow from assetwatch-jobs repo"
 ---
 
 # Research: Firmware Version Management, Lazy Loader, and FirmwareID/FirmwareVersion Update Flow
@@ -387,8 +388,470 @@ For sensor products (ProductID 3,16), the `Sensor_GetFirmwareVersion` procedure 
 
 ## Open Questions
 
-1. **Where is `Firmware_GetSensorsToUpdate` invoked from?** — Referenced as "moved to jobs repo" in the inventory variant. The scheduling/invocation logic lives in an external repository not present in this codebase.
-2. **Where is `Request_AcknowledgeRequest` invoked from?** — The MQTT processing pipeline that handles firmware completion messages appears to live in an external service.
-3. **What sets `Receiver.FirmwareVersion` initially?** — No procedure in this repo appears to set `Receiver.FirmwareVersion` for sensor products. It may be set during initial sensor provisioning/check-in from an external process.
+~~1. **Where is `Firmware_GetSensorsToUpdate` invoked from?**~~ — **ANSWERED** in follow-up research below
+~~2. **Where is `Request_AcknowledgeRequest` invoked from?**~~ — **ANSWERED** in follow-up research below
+3. **What sets `Receiver.FirmwareVersion` initially?** — No procedure in either repo appears to set `Receiver.FirmwareVersion` for sensor products. It may be set during initial sensor provisioning/check-in from an external process.
 4. **What is the FacilityFirmware.LockFirmwareVersion flag used for in the main lazy loader?** — The main `Firmware_GetSensorsToUpdate` procedure does not check `LockFirmwareVersion`. It's used by `FacilityFirmware_Update` to prevent global updates from overwriting locked facilities, but the lazy loader itself would still attempt to update locked facilities if a FacilityFirmware record exists.
 5. **What about the `TargetFirmewareID` (sic) fields?** — Both `Firmware.TargetFirmewareID` and `Part.TargetFirmewareID` exist in the schema but are not used in any of the active lazy loader or update procedures examined.
+
+## Follow-up Research [2026-02-06T09:59:38-05:00]
+
+After discovering the `assetwatch-jobs` repository, I traced the complete external service flow that was previously unknown. This research answers Open Questions #1 and #2 above.
+
+### Complete External Service Architecture
+
+**Repositories involved:**
+- `fullstack.assetwatch` — Database schemas, stored procedures, frontend, firmware CRUD Lambda
+- `assetwatch-jobs` — Scheduled jobs, request processors, MQTT acknowledgement handlers
+
+### Phase 1: Lazy Loader Scheduling (VALIDATED)
+
+**Location:** `assetwatch-jobs/terraform/jobs/jobs_hardware/eventbridge.tf:31-57`
+
+EventBridge scheduler runs **every 2 minutes** in production:
+```hcl
+resource "aws_scheduler_schedule" "jobs_push_missing_firmware_event" {
+  schedule_expression = "cron(*/2 * * * ? *)"
+  state = (var.env == "prod" && var.branch == "master") ? "ENABLED" : "DISABLED"
+
+  target {
+    arn = aws_lambda_function.jobs_hardware.arn
+    input = jsonencode({ "meth" : "pushMissingFW" })
+  }
+}
+```
+
+**Comment in code (line 29):** "My math says we could do 100 every 5 minutes and still update the sensor fleet in ~ a week. Must update the corresponding stored proc to limit 100 from 75. Firmware_GetSensorsToUpdate"
+
+### Phase 2: Lazy Loader Execution (VALIDATED)
+
+**Location:** `assetwatch-jobs/terraform/jobs/jobs_hardware/jobs-hardware/main.py:74-82`
+
+```python
+elif meth == "pushMissingFW":
+    # Lazy loader to check when sensors have outdated firmware versions
+    # and then pushes firmware updates to sensors.
+    missing_fw = hardware.get_missing_sensor_fw()
+    print(f"get_missing_sensor_fw query output for missing_fw: {missing_fw}")
+
+    if len(missing_fw) > 0:
+        hardware.push_missing_sensor_fw(missing_fw)
+    else:
+        print(f"No missing sensor firwmware found")
+```
+
+**Location:** `assetwatch-jobs/terraform/jobs/jobs_hardware/jobs-hardware/hardware.py:32-37`
+
+```python
+def get_missing_sensor_fw():
+    query = "CALL Firmware_GetSensorsToUpdate();"
+    retVal = db.mysql_read(query, "cursor")
+    return retVal
+```
+
+**Returns:** `[(FirmwareID, FirmwareVersion, FileName, ReceiverID, ReceiverSerialNumber, ReceiverPartNumber, TransponderSerialNumber), ...]`
+
+### Phase 3: Request Lambda Invocation (VALIDATED)
+
+**Location:** `assetwatch-jobs/terraform/jobs/jobs_hardware/jobs-hardware/hardware.py:40-72`
+
+```python
+def push_missing_sensor_fw(missing_fw):
+    sensor_fw_client = boto3.client("lambda")
+    RQID = int(time.time())  # Unix timestamp as request ID
+
+    for data in missing_fw:
+        FileName = data[2]  # From lazy loader output
+        ReceiverSerialNumber = data[4]
+        ReceiverPartNumber = data[5]
+
+        receiver = f"{ReceiverPartNumber}_{ReceiverSerialNumber}"
+
+        request = {
+            "RequestType": "SensorFirmware",
+            "rqid": RQID,
+            "Sensor": receiver,
+            "FirmwareFileName": FileName,  # ← Critical: FileName from lazy loader
+            "User": "e3ea0b52-21db-45bc-8716-220d9209d14e"  # James Maxwell
+        }
+
+        # Invoke request-sensor-firmware Lambda asynchronously
+        response = sensor_fw_client.invoke(
+            FunctionName=JOBS_REQUEST_SENSOR_FIRMWARE_NAME,
+            Payload=json.dumps({"body": json.dumps(request)}),
+            InvocationType="Event"
+        )
+```
+
+### Phase 4: Request Creation with FirmwareID Lookup (VALIDATED)
+
+**Location:** `assetwatch-jobs/terraform/jobs/request_v2/request-sensor-firmware/main.py:67-228`
+
+**Critical FirmwareID lookup (lines 144-152):**
+```python
+firmware_version = firmware_common.get_firmware_version(firmware_filename, smpn)
+firmware_id = firmware_common.get_firmware_id(firmware_filename, smpn)
+print(f"firmware_version: {firmware_version} firmware_id: {firmware_id}")
+```
+
+**Location:** `assetwatch-jobs/terraform/jobs/request_v2/request-sensor-firmware/firmware_common.py:64-78`
+
+```python
+def get_firmware_id(firmware_file_name, smpn):
+    query = f"""
+    SELECT fw.FirmwareID
+    FROM Firmware fw
+        INNER JOIN Part pt ON pt.PartID = fw.PartID
+    WHERE fw.FileName = '{firmware_file_name}'
+    AND pt.PartNumber = '{smpn}';
+    """
+
+    retVal = db.mysql_read(query)
+    return_val = retVal[0]["FirmwareID"]
+
+    return return_val if len(retVal) > 0 else None
+```
+
+**THIS IS THE CRITICAL LOOKUP:** FileName → FirmwareID translation happens here!
+
+**Get hubs at facility (main.py:154):**
+```python
+hub_list = get_hubs_at_facility(sensor)
+# Calls: Jobs.Receiver_GetFacilityHubsByReceiver(sensor)
+```
+
+**Create Request record for each hub (lines 168-181):**
+```python
+newRequest = firmware_common.get_sql(
+    rqid, smsn, 1, 6, hub_part_number, sensor, smpn, user, firmware_id
+)
+result = db.mysql_write(newRequest)
+```
+
+**Location:** `firmware_common.py:27-46`
+
+```python
+def get_sql(rqid, smsnList, request_status_id, request_type_id,
+            hpn, sensor, smpn, username, fwid):
+    query = f"CALL Request_AddRequest({rqid}, '{request_status_id}', '{request_type_id}', '', '{hpn}', '{sensor}', '{smpn}', '{username}', {fwid});"
+    return query
+```
+
+**Stored Procedure:** `fullstack.assetwatch/mysql/db/procs/R__PROC_Request_AddRequest.sql:69-70`
+
+```sql
+INSERT INTO Request (RQID, DateCreated, RequestTypeID, RequestStatusID,
+                     ReceiverID, UserID, FacilityID, FirmwareID)
+VALUES (inRQID, FROM_UNIXTIME(inRQID), @RequestTypeID, inRequestStatusID,
+        @ReceiverID, @UserID, @FacilityID, @FirmwareID);
+```
+
+**FirmwareID is stored in Request table!**
+
+**Send MQTT message (main.py:184-210):**
+```python
+topic = f"nikola/20/down/{hub_part_number}/{hub_serial_number}/firmware"
+
+payload = {
+    "rqid": rqid,
+    "v": firmware_version,  # Version string for display
+    "smsn": smsn,
+    "smpn": smpn,
+    "filename": firmware_filename,
+    "url": presigned_s3_url  # 6-hour expiration from S3
+}
+
+mqtt_object = {"topic": topic, "payload": payload, "user": user, "rqid": rqid, "trace_id": trace_id}
+send_to_sqs(MQTT_REQUEST_QUEUE, mqtt_object)
+```
+
+### Phase 5: Hub Downloads and Installs Firmware
+
+**UNVALIDATED ASSUMPTION:** Hub receives MQTT message, downloads firmware from S3 presigned URL, pushes to sensor via BLE, sensor installs firmware. This logic lives on the physical hub device (embedded firmware).
+
+### Phase 6: Acknowledgement Processing (VALIDATED)
+
+**Trigger:** MQTT message from hub on topic matching `/firmware/updateversion`
+
+**Location:** `assetwatch-jobs/terraform/jobs/jobs_data_ingestion_firmware/jobs-data-ingestion-firmware/dataParser.py:54-96`
+
+```python
+def parse_sensor_update_firmware_version(topic, payload, mqtt_message_id):
+    """Parse and process sensor firmware version update."""
+    topic_split = topic.split("/")
+    transponder_serial_number = topic_split[4]
+    transponder_part_number = topic_split[3]
+
+    rqid = payload["rqid"]
+    sensor_serial_number = str(payload["smsn"]).zfill(7)
+    sensor_part_number = payload["smpn"]
+    request_status_id = 3  # Success
+    request_type = "Sensor Firmware"
+
+    # Log pattern for CloudWatch dashboard
+    app_logger.info(
+        f"Sensor firmware version update - RQID: {rqid}, "
+        f"Hub: {transponder_part_number}/{transponder_serial_number}, "
+        f"Sensor: {sensor_part_number}/{sensor_serial_number}"
+    )
+
+    sql_query = "CALL Jobs.Request_AcknowledgeRequest_v2(%s, %s, %s, %s, %s, %s, %s, %s);"
+    params = (
+        rqid, request_status_id, request_type,
+        transponder_serial_number, transponder_part_number,
+        sensor_serial_number, sensor_part_number, mqtt_message_id
+    )
+
+    result = db.mysql_write(sql_query, params=params, use_shared=True)
+```
+
+**Stored Procedure:** `assetwatch-jobs/mysql/db/procs/R__PROC_Request_AcknowledgeRequest_v2.sql:298-322`
+
+This is an **optimized v2 procedure** that flattens the original `Request_AcknowledgeRequest` to reduce ~25 queries to ~10 by eliminating redundant lookups.
+
+```sql
+-- Sensor Firmware success (type 6, status 3)
+IF (localRequestTypeID = 6 AND localRequestStatusID = 3) THEN
+    -- Look up FirmwareID from Request record
+    SET localFirmwareID = (
+        SELECT FirmwareID
+        FROM Vero.Request
+        WHERE RQID = inRQID
+        AND ReceiverID = localReceiverID
+        AND RequestTypeID = 6
+    );
+
+    -- Update Receiver firmware
+    UPDATE Vero.Receiver
+    SET FirmwareID = localFirmwareID,
+        _version = _version + 1
+    WHERE ReceiverID = localReceiverID;
+
+    -- Close out current firmware history
+    UPDATE Vero.ReceiverFirmwareHistory
+    SET EndDate = NOW()
+    WHERE ReceiverID = localReceiverID
+    AND EndDate IS NULL;
+
+    -- Create new firmware history record
+    INSERT INTO Vero.ReceiverFirmwareHistory (ReceiverID, FirmwareID, StartDate)
+    VALUES (localReceiverID, localFirmwareID, NOW());
+END IF;
+```
+
+**Note:** The fullstack.assetwatch repo has `R__PROC_Request_AcknowledgeRequest.sql` (original version). The jobs repo has `R__PROC_Request_AcknowledgeRequest_v2.sql` (optimized version) that is actually called in production.
+
+### Complete Validated Data Flow Chain
+
+```
+1. EventBridge (every 2 minutes)
+   └─> jobs_hardware Lambda (meth="pushMissingFW")
+
+2. hardware.get_missing_sensor_fw()
+   └─> CALL Firmware_GetSensorsToUpdate()
+   └─> Returns: [(FirmwareID, Version, FileName, ReceiverID, SerialNumber, PartNumber, HubSerial), ...]
+
+3. hardware.push_missing_sensor_fw(missing_fw)
+   └─> For each sensor:
+       └─> Invoke request-sensor-firmware Lambda
+           └─> Pass: {FileName, Sensor, RQID, User}
+
+4. request-sensor-firmware Lambda
+   └─> firmware_common.get_firmware_id(FileName, PartNumber)
+       └─> SELECT FirmwareID FROM Firmware WHERE FileName=? AND PartNumber=?
+       └─> Returns: FirmwareID (or None if not found)
+
+   └─> get_hubs_at_facility(sensor)
+       └─> Returns: list of hubs that can reach this sensor
+
+   └─> For each hub:
+       └─> CALL Request_AddRequest(RQID, ..., FirmwareID)
+           └─> INSERT INTO Request (..., FirmwareID) VALUES (..., FirmwareID)
+       └─> Send MQTT message to hub with presigned S3 URL
+
+5. Hub (embedded firmware - UNVALIDATED)
+   └─> Downloads firmware from S3
+   └─> Pushes to sensor via BLE
+   └─> Sensor installs firmware
+   └─> Sends success confirmation via MQTT
+
+6. jobs_data_ingestion_firmware (MQTT processor)
+   └─> Receives MQTT on topic /firmware/updateversion
+   └─> parse_sensor_update_firmware_version()
+   └─> CALL Jobs.Request_AcknowledgeRequest_v2(RQID, 3, ...)
+       └─> SELECT FirmwareID FROM Request WHERE RQID=? AND ReceiverID=?
+       └─> UPDATE Receiver SET FirmwareID=? WHERE ReceiverID=?
+       └─> INSERT INTO ReceiverFirmwareHistory (ReceiverID, FirmwareID, StartDate)
+
+7. Next lazy loader run (2 minutes later)
+   └─> Firmware_GetSensorsToUpdate()
+   └─> Compares Receiver.FirmwareID vs target
+   └─> Sensor excluded (FirmwareID now matches)
+```
+
+### Critical Failure Points Where FirmwareID Could Be Wrong
+
+**Point A: Lazy Loader Returns Wrong FileName** (VALIDATED)
+- If `Firmware_GetSensorsToUpdate` joins incorrectly to FacilityFirmware or Part
+- If `FacilityFirmware.FirmwareID` points to wrong firmware
+- If `Part.DefaultFirmwareID` points to wrong firmware
+- **Impact:** Wrong firmware file targeted for deployment
+
+**Point B: FirmwareID Lookup Fails** (VALIDATED - `firmware_common.get_firmware_id()`)
+```python
+# If this query returns 0 rows:
+SELECT FirmwareID FROM Firmware fw
+INNER JOIN Part pt ON pt.PartID = fw.PartID
+WHERE fw.FileName = '{firmware_file_name}'
+AND pt.PartNumber = '{smpn}';
+
+# Then: return_val = retVal[0]["FirmwareID"]  ← IndexError or None
+```
+
+**Causes:**
+- FileName doesn't match any Firmware record (typo, case sensitivity)
+- PartNumber doesn't match
+- Firmware record was deleted after lazy loader ran but before request created
+- **Result:** `firmware_id = None`, Request created with `FirmwareID = NULL`
+
+**Point C: Request Record Created with NULL FirmwareID** (VALIDATED)
+```sql
+-- R__PROC_Request_AddRequest.sql:26-30
+IF (inFirmwareID = 0) THEN
+    SET @FirmwareID = NULL;
+ELSE
+    SET @FirmwareID = (SELECT FirmwareID FROM Firmware WHERE FirmwareID = inFirmwareID);
+END IF;
+```
+
+If `inFirmwareID` is NULL, 0, or doesn't exist in Firmware table:
+- **Result:** `Request.FirmwareID = NULL`
+
+**Point D: Acknowledgement Lookup Fails** (VALIDATED)
+```sql
+-- R__PROC_Request_AcknowledgeRequest_v2.sql:299-305
+SET localFirmwareID = (
+    SELECT FirmwareID
+    FROM Vero.Request
+    WHERE RQID = inRQID
+    AND ReceiverID = localReceiverID
+    AND RequestTypeID = 6
+);
+```
+
+**Causes:**
+- RQID mismatch (clock skew, incorrect timestamp)
+- ReceiverID mismatch (serial number lookup failed)
+- Request record doesn't exist
+- **Result:** `localFirmwareID = NULL`, then `UPDATE Receiver SET FirmwareID = NULL`
+
+**Point E: Receiver.FirmwareVersion Never Updated** (VALIDATED)
+- **Intentional design:** `Receiver.FirmwareVersion` is NOT updated for sensors
+- Only `Receiver.FirmwareID` is updated
+- Version string retrieved via FK join: `SELECT Version FROM Firmware WHERE FirmwareID = Receiver.FirmwareID`
+- **This is not a bug** — it's the intended architecture
+
+### Diagnostic Queries for "Already Updated" Bug
+
+**Check if sensors have correct FirmwareID:**
+```sql
+SELECT
+    r.ReceiverID,
+    r.SerialNumber,
+    r.FirmwareID AS CurrentFirmwareID,
+    r.FirmwareVersion AS CurrentFirmwareVersionField,
+    fw.Version AS CurrentFirmwareVersionFromFK,
+    fw.FileName AS CurrentFirmwareFileName,
+    p.DefaultFirmwareID AS PartDefaultFirmwareID,
+    dfw.Version AS PartDefaultVersion,
+    dfw.FileName AS PartDefaultFileName,
+    ffw.FirmwareID AS FacilityOverrideFirmwareID,
+    ffw_fw.Version AS FacilityOverrideVersion,
+    ffw_fw.FileName AS FacilityOverrideFileName,
+    CASE
+        WHEN ffw.FirmwareID IS NOT NULL THEN ffw.FirmwareID
+        ELSE p.DefaultFirmwareID
+    END AS TargetFirmwareID,
+    CASE
+        WHEN ffw.FirmwareID IS NOT NULL AND ffw.FirmwareID <> r.FirmwareID THEN 'MISMATCH (Facility Override)'
+        WHEN ffw.FirmwareID IS NULL AND p.DefaultFirmwareID <> r.FirmwareID THEN 'MISMATCH (Part Default)'
+        ELSE 'MATCH'
+    END AS Status
+FROM Receiver r
+INNER JOIN Part p ON p.PartID = r.PartID
+INNER JOIN Firmware dfw ON dfw.FirmwareID = p.DefaultFirmwareID
+LEFT JOIN Firmware fw ON fw.FirmwareID = r.FirmwareID
+INNER JOIN MonitoringPoint_Receiver mpr ON mpr.ReceiverID = r.ReceiverID AND mpr.ActiveFlag = 1
+INNER JOIN MonitoringPoint mp ON mp.MonitoringPointID = mpr.MonitoringPointID
+INNER JOIN Machine m ON m.MachineID = mp.MachineID
+INNER JOIN Line l ON l.LineID = m.LineID
+LEFT JOIN FacilityFirmware ffw ON ffw.FacilityID = l.FacilityID AND ffw.PartID = p.PartID
+LEFT JOIN Firmware ffw_fw ON ffw_fw.FirmwareID = ffw.FirmwareID
+WHERE r.SerialNumber IN ('0012345', '0067890')  -- Problem sensors
+ORDER BY r.SerialNumber;
+```
+
+**Check recent Request records:**
+```sql
+SELECT
+    r.RequestID,
+    r.RQID,
+    FROM_UNIXTIME(r.RQID) AS RQIDTimestamp,
+    r.ReceiverID,
+    rx.SerialNumber AS ReceiverSerialNumber,
+    r.FirmwareID AS RequestFirmwareID,
+    fw.Version AS RequestFirmwareVersion,
+    fw.FileName AS RequestFirmwareFileName,
+    r.RequestStatusID,
+    rs.RequestStatusName,
+    r.RequestTypeID,
+    rt.RequestTypeName,
+    r.DateCreated,
+    TIMESTAMPDIFF(SECOND, r.DateCreated, NOW()) AS SecondsAgo
+FROM Request r
+INNER JOIN Receiver rx ON rx.ReceiverID = r.ReceiverID
+LEFT JOIN Firmware fw ON fw.FirmwareID = r.FirmwareID
+INNER JOIN RequestStatus rs ON rs.RequestStatusID = r.RequestStatusID
+INNER JOIN RequestType rt ON rt.RequestTypeID = r.RequestTypeID
+WHERE rx.SerialNumber IN ('0012345', '0067890')
+AND r.RequestTypeID = 6
+ORDER BY r.DateCreated DESC
+LIMIT 20;
+```
+
+**Check for NULL FirmwareID in recent requests:**
+```sql
+SELECT
+    COUNT(*) AS CountWithNullFirmwareID,
+    MIN(DateCreated) AS OldestNull,
+    MAX(DateCreated) AS NewestNull
+FROM Request
+WHERE RequestTypeID = 6
+AND FirmwareID IS NULL
+AND DateCreated > DATE_SUB(NOW(), INTERVAL 7 DAY);
+```
+
+### Additional Code References (Jobs Repo)
+
+**Lazy Loader:**
+- `assetwatch-jobs/terraform/jobs/jobs_hardware/eventbridge.tf:31-57` — EventBridge schedule (every 2 minutes)
+- `assetwatch-jobs/terraform/jobs/jobs_hardware/jobs-hardware/main.py:74-82` — Lazy loader invocation
+- `assetwatch-jobs/terraform/jobs/jobs_hardware/jobs-hardware/hardware.py:32-72` — Lazy loader execution and Lambda invocation
+
+**Request Processing:**
+- `assetwatch-jobs/terraform/jobs/request_v2/request-sensor-firmware/main.py` — Request Lambda handler
+- `assetwatch-jobs/terraform/jobs/request_v2/request-sensor-firmware/firmware_common.py` — FirmwareID lookup logic
+
+**Acknowledgement:**
+- `assetwatch-jobs/terraform/jobs/jobs_data_ingestion_firmware/jobs-data-ingestion-firmware/dataParser.py` — MQTT acknowledgement processor
+- `assetwatch-jobs/mysql/db/procs/R__PROC_Request_AcknowledgeRequest_v2.sql` — Optimized acknowledgement stored procedure
+
+### Unvalidated Assumptions
+
+**ASSUMPTION 1:** Hub embedded firmware correctly downloads from S3 presigned URL, transfers to sensor via BLE, and reports success/failure via MQTT. *This logic is not in the repos examined — it lives on the physical hub device.*
+
+**ASSUMPTION 2:** MQTT message format from hub matches exactly what `dataParser.py` expects. *The parser code exists but actual MQTT messages from hubs were not examined.*
+
+**ASSUMPTION 3:** The `jobs_data_ingestion_firmware` service is the only path that processes firmware update confirmations. *No other MQTT processors were found that call Request_AcknowledgeRequest, but other services might exist.*
+
+**ASSUMPTION 4:** Clock synchronization between lazy loader RQID generation (Unix timestamp) and acknowledgement lookup is reliable. *If clocks drift or timezones differ between services, RQID matching could fail.*
